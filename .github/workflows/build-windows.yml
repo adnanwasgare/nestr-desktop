@@ -11,6 +11,15 @@ name: Build Windows Installer
     tags: ["v*"]
   workflow_dispatch: {}
 
+# GitHub defaults the automatic token every workflow gets to read-only
+# permissions on new repositories (a security hardening default since
+# 2023) -- creating a release needs write access, and that has to be
+# requested explicitly here, it's no longer assumed. This is exactly
+# what the "Resource not accessible by integration" 403 error was
+# actually about, confirmed against the real error rather than guessed.
+permissions:
+  contents: write
+
 jobs:
   build:
     # A real Windows machine, hosted by GitHub, with full internet
