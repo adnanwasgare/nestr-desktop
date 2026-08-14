@@ -1,0 +1,57 @@
+name: Build Windows Installer
+
+# "on" is quoted here on purpose -- unquoted, YAML 1.1 parsers (PyYAML
+# among them) read the bare word "on" as the boolean true, not the
+# string GitHub Actions expects as this key. Quoting removes the
+# ambiguity entirely rather than relying on GitHub's parser being more
+# forgiving about it.
+"on":
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    # A real Windows machine, hosted by GitHub, with full internet
+    # access -- this is the actual compilation step that can't happen
+    # in a sandboxed environment with no network.
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm install
+
+      # A plain branch push (or manual run) just builds, so you can
+      # confirm it compiles without creating a public release every
+      # time. Nothing is published here.
+      - name: Build only (branch push / manual run)
+        if: "!startsWith(github.ref, 'refs/tags/v')"
+        run: npm run build:win
+
+      - name: Upload the build (branch push / manual run)
+        if: "!startsWith(github.ref, 'refs/tags/v')"
+        uses: actions/upload-artifact@v4
+        with:
+          name: nestr-desktop-windows
+          path: dist/*.exe
+
+      # Pushing a version tag (e.g. "v2.0.3") is what actually
+      # publishes a real GitHub Release -- the metadata electron-
+      # updater needs to detect this as a newer version for anyone
+      # already running an older, installed copy of the app.
+      # GITHUB_TOKEN is provided automatically by Actions; nothing
+      # extra to configure for this to authenticate.
+      - name: Build and publish release (version tag push only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: npm run release:win
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

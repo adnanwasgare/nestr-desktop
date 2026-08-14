@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Nestr</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+  <!-- 1. Company code -->
+  <div id="company-screen" class="screen">
+    <div class="auth-box">
+      <div class="brand">
+        <img class="brand-icon" src="../assets/icon.svg" alt="">
+        <span>Nestr</span>
+      </div>
+      <p class="auth-sub">Enter your company code to continue</p>
+      <form id="company-form">
+        <div class="field">
+          <label for="company-code">Company code</label>
+          <input type="text" id="company-code" autocomplete="off" required>
+        </div>
+        <button type="submit" id="company-btn">Continue</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- 2. Employee login -->
+  <div id="login-screen" class="screen" hidden>
+    <div class="auth-box">
+      <p class="auth-title">Sign in to <span id="login-company-code"></span></p>
+      <form id="login-form">
+        <div class="field">
+          <label for="employee-id">Employee ID</label>
+          <input type="text" id="employee-id" autocomplete="off" required>
+        </div>
+        <div class="field">
+          <label for="pin">PIN</label>
+          <input type="password" id="pin" autocomplete="off" required>
+        </div>
+        <p id="login-error" class="error" hidden></p>
+        <button type="submit" id="login-btn">Sign in</button>
+        <button type="button" id="login-back-btn" class="link-btn">&larr; Different company</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- 3. Monitoring consent -->
+  <div id="consent-screen" class="screen" hidden>
+    <div class="auth-box">
+      <h2>Screen Activity Notice</h2>
+      <p id="consent-text" class="consent-text"></p>
+      <button id="consent-accept-btn">I Understand and Agree</button>
+    </div>
+  </div>
+
+  <!-- 4. Check in (mandatory, no skip) -->
+  <div id="checkin-screen" class="screen" hidden>
+    <div class="auth-box" style="text-align:center;">
+      <div class="checkin-icon"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/></svg></div>
+      <p class="auth-title" id="checkin-name">Welcome</p>
+      <p class="auth-sub">Check in to start your day.</p>
+      <p id="checkin-warning" class="shift-warning" hidden></p>
+      <p id="checkin-error" class="error" hidden></p>
+      <button id="checkin-btn">Check in</button>
+    </div>
+  </div>
+
+  <!-- 5. Dashboard -->
+  <div id="dashboard-screen" class="screen" hidden>
+    <div class="topbar">
+      <div class="who">
+        <div class="avatar" id="who-avatar"></div>
+        <span id="who-name">&mdash;</span>
+      </div>
+      <div class="topbar-actions">
+        <button id="theme-toggle-btn" class="icon-btn" aria-label="Toggle theme"></button>
+        <button id="logout-btn" class="icon-btn" aria-label="Sign out"></button>
+      </div>
+    </div>
+
+    <div id="monitoring-banner" class="monitoring-banner" hidden>Screen activity and periodic screenshots are being recorded while you're checked in.</div>
+
+    <div class="timer-block">
+      <p class="timer-status" id="punch-status">&mdash;</p>
+      <p class="timer-clock" id="punch-timer">00:00:00</p>
+      <p class="timer-sub" id="punch-since"></p>
+    </div>
+
+    <p id="punch-error" class="error" style="text-align:center;" hidden></p>
+
+    <div class="dash-actions">
+      <button id="break-btn" class="dash-btn"></button>
+      <button id="checkout-btn" class="dash-btn dash-btn-danger">Check out</button>
+      <button id="messenger-btn" class="dash-btn dash-btn-primary">
+        Messenger
+        <span id="messenger-badge" class="badge" hidden>0</span>
+      </button>
+    </div>
+  </div>
+
+  <!-- 6. Messenger -->
+  <div id="messenger-screen" class="screen" hidden>
+    <div class="topbar">
+      <button id="messenger-back-btn" class="link-btn">&larr; Back</button>
+      <span>Messenger</span>
+      <span style="width:44px;"></span>
+    </div>
+
+    <div id="conv-list" class="conv-list"></div>
+    <div id="thread-view" class="thread-view" hidden>
+      <div class="thread-head">
+        <button id="thread-back" class="link-btn">&larr;</button>
+        <span id="thread-name"></span>
+      </div>
+      <div id="thread-bubbles" class="thread-bubbles"></div>
+      <div class="thread-input-row">
+        <input type="text" id="thread-input" placeholder="Message&hellip;">
+        <button id="thread-send">Send</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,46 @@
+{
+  "name": "nestr-desktop",
+  "version": "2.3.1",
+  "description": "Nestr desktop companion \u2014 sign in, Break In/Out, and messaging.",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build:win": "electron-builder --win --publish never",
+    "release:win": "electron-builder --win --publish always"
+  },
+  "author": "",
+  "license": "UNLICENSED",
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.0",
+    "electron-updater": "^6.3.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "electron": "^31.0.0",
+    "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "appId": "com.nestr.desktop",
+    "productName": "Nestr",
+    "publish": {
+      "provider": "github",
+      "owner": "adnanwasgare",
+      "repo": "nestr-desktop"
+    },
+    "win": {
+      "target": "nsis",
+      "icon": "assets/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "include": "installer/monitoring-notice.nsh"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "renderer/**/*",
+      "assets/**/*"
+    ]
+  }
+}
