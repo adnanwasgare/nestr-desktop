@@ -182,9 +182,6 @@
   function enterDashboard(knownState) {
     el('who-name').textContent = session.fullName;
     el('who-avatar').textContent = initials(session.fullName);
-    window.nestrAPI.getMonitoringStatus().then(function (status) {
-      el('monitoring-banner').hidden = !(status.enabled && status.consented);
-    });
     showScreen('dashboard');
     // Use the state the check-in call itself just returned rather than
     // immediately re-fetching -- a fresh read right after that write

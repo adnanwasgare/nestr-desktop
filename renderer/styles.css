@@ -98,12 +98,6 @@ body[data-theme="dark"] .shift-warning { color: #fbbf24; background: #451a03; bo
 }
 .icon-btn:hover { background: var(--bg); color: var(--ink); }
 
-.monitoring-banner {
-  font-size: 11.5px; color: #92400e; background: #fffbeb; border-bottom: 1px solid #fde68a;
-  padding: 7px 16px; text-align: center;
-}
-body[data-theme="dark"] .monitoring-banner { color: #fbbf24; background: #451a03; border-bottom-color: #78350f; }
-
 .timer-block { text-align: center; padding: 28px 16px 20px; }
 .timer-status { font-size: 13px; color: var(--text-secondary); margin: 0 0 6px; }
 .timer-clock { font-size: 30px; font-weight: 600; margin: 0; font-variant-numeric: tabular-nums; letter-spacing: 0.02em; }
