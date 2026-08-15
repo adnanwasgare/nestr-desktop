@@ -21,6 +21,36 @@
   }
   function two(n) { return n < 10 ? '0' + n : String(n); }
 
+  // Wraps the browser's geolocation API in a promise -- Electron's
+  // renderer process is a real browser window (unlike the main
+  // process, where this API doesn't exist at all), so this can live
+  // here directly. Same error-message reasoning as the web app's
+  // own copy of this helper: permission-denied needs different
+  // guidance than a timeout.
+  function getLocation() {
+    return new Promise(function (resolve, reject) {
+      if (!navigator.geolocation) {
+        reject(new Error('This device doesn\u2019t support location. Location is required to check in.'));
+        return;
+      }
+      navigator.geolocation.getCurrentPosition(
+        function (pos) { resolve({ lat: pos.coords.latitude, lng: pos.coords.longitude }); },
+        function (err) {
+          var msg;
+          if (err.code === err.PERMISSION_DENIED) {
+            msg = 'Location access is blocked for Nestr. Enable it in your system\u2019s privacy/location settings, then try again.';
+          } else if (err.code === err.TIMEOUT) {
+            msg = 'Getting your location took too long. Check your device\u2019s location/GPS is on, then try again.';
+          } else {
+            msg = 'Couldn\u2019t determine your location. Check your device\u2019s location/GPS is on, then try again.';
+          }
+          reject(new Error(msg));
+        },
+        { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
+      );
+    });
+  }
+
   var SCREENS = ['company', 'login', 'consent', 'checkin', 'dashboard', 'messenger'];
   function showScreen(which) {
     SCREENS.forEach(function (s) { el(s + '-screen').hidden = s !== which; });
@@ -79,7 +109,10 @@
     var employeeId = el('employee-id').value.trim();
     var pin = el('pin').value;
 
-    window.nestrAPI.login(companyCode, employeeId, pin)
+    // Location is mandatory at login here too, matching the web app
+    // -- same reasoning as the four punch handlers above.
+    getLocation()
+      .then(function (loc) { return window.nestrAPI.login(companyCode, employeeId, pin, loc); })
       .then(function (s) {
         session = s;
         el('pin').value = '';
@@ -166,7 +199,10 @@
     btn.disabled = true;
     btn.textContent = 'Checking in\u2026';
 
-    window.nestrAPI.checkIn()
+    // Location is mandatory for every punch, same as the web app --
+    // captured fresh right before the action, not cached.
+    getLocation()
+      .then(function (loc) { return window.nestrAPI.checkIn(loc); })
       .then(function (state) { enterDashboard(state); })
       .catch(function (err) {
         errEl.textContent = (err && err.message) || 'Could not check in.';
@@ -229,7 +265,7 @@
       el('punch-timer').textContent = 'On break';
       stopTimer();
       breakBtn.textContent = 'End break';
-      breakBtn.onclick = function () { doPunchAction(window.nestrAPI.breakEnd()); };
+      breakBtn.onclick = function () { doPunchAction(getLocation().then(function (loc) { return window.nestrAPI.breakEnd(loc); })); };
       checkoutBtn.disabled = false;
       return;
     }
@@ -238,7 +274,7 @@
     el('punch-since').textContent = state.firstIn ? ('Since ' + timeLabel(state.firstIn)) : '';
     startTimer(state.firstIn, state.breakMs);
     breakBtn.textContent = 'Start break';
-    breakBtn.onclick = function () { doPunchAction(window.nestrAPI.breakStart()); };
+    breakBtn.onclick = function () { doPunchAction(getLocation().then(function (loc) { return window.nestrAPI.breakStart(loc); })); };
     checkoutBtn.disabled = false;
   }
 
@@ -262,10 +298,12 @@
 
   el('checkout-btn').addEventListener('click', function () {
     doPunchAction(
-      window.nestrAPI.checkOut().then(function (state) {
-        stopTimer();
-        return state;
-      })
+      getLocation()
+        .then(function (loc) { return window.nestrAPI.checkOut(loc); })
+        .then(function (state) {
+          stopTimer();
+          return state;
+        })
     );
   });
 
@@ -294,17 +332,46 @@
     showScreen('messenger');
     activeThreadId = null;
     el('thread-view').hidden = true;
+    el('conv-search').value = '';
     loadConversations();
   });
   el('messenger-back-btn').addEventListener('click', function () { showScreen('dashboard'); });
-  el('thread-back').addEventListener('click', function () { el('thread-view').hidden = true; });
+  el('thread-back').addEventListener('click', function () {
+    el('thread-view').hidden = true;
+    // Covers the case where the thread was opened via search and a
+    // message was just sent -- that search result is now a real
+    // conversation, so a clean reload rather than re-showing
+    // whatever was on screen before (stale search results, or a
+    // conv-list that hasn't picked up the new conversation yet).
+    el('conv-search').value = '';
+    loadConversations();
+  });
+
+  // Small debounce -- this is a local IPC call, not a network
+  // request, but a large company's colleague list is still real
+  // computation to redo on every single keystroke.
+  var searchDebounce = null;
+  el('conv-search').addEventListener('input', function () {
+    var query = this.value;
+    clearTimeout(searchDebounce);
+    searchDebounce = setTimeout(function () {
+      if (!query.trim()) { renderConvList(); return; }
+      window.nestrAPI.searchPeople(query).then(renderSearchResults);
+    }, 150);
+  });
+
+  // Android-style badge convention: cap the displayed count rather
+  // than showing an arbitrarily long number.
+  function fmtBadgeCount(n) {
+    return n > 99 ? '99+' : String(n);
+  }
 
   function refreshUnreadBadge() {
     window.nestrAPI.getConversations().then(function (rows) {
       conversations = rows;
       var total = rows.reduce(function (sum, r) { return sum + (r.unread || 0); }, 0);
       var badge = el('messenger-badge');
-      badge.textContent = total;
+      badge.textContent = fmtBadgeCount(total);
       badge.hidden = total === 0;
     });
   }
@@ -320,18 +387,43 @@
   function renderConvList() {
     var listEl = el('conv-list');
     if (!conversations.length) {
-      listEl.innerHTML = '<div class="empty-state">No colleagues to message yet.</div>';
+      listEl.innerHTML = '<div class="empty-state">No messages yet. Search above to message a colleague.</div>';
       return;
     }
     listEl.innerHTML = conversations.map(function (r) {
-      var preview = r.last ? r.last.body : 'No messages yet';
+      var preview = r.last ? (r.last.sender_id === session.employeeId ? 'You: ' : '') + r.last.body : 'No messages yet';
+      var avatar = r.isGroup ? '\u{1F465}' : initials(r.name);
       return '<div class="conv-row" data-id="' + r.id + '">' +
-        '<div class="avatar">' + initials(r.person.name) + '</div>' +
+        '<div class="avatar"' + (r.isGroup ? ' style="background:#64748b;"' : '') + '>' + avatar + '</div>' +
         '<div style="min-width:0; flex:1;">' +
-          '<p class="conv-name">' + r.person.name + '</p>' +
+          '<p class="conv-name">' + r.name + (r.isGroup ? ' <span style="font-weight:400; opacity:0.65;">(group)</span>' : '') + '</p>' +
           '<p class="conv-preview">' + preview + '</p>' +
         '</div>' +
-        (r.unread ? '<span class="conv-unread">' + r.unread + '</span>' : '') +
+        (r.unread ? '<span class="conv-unread">' + fmtBadgeCount(r.unread) + '</span>' : '') +
+      '</div>';
+    }).join('');
+    listEl.querySelectorAll('.conv-row').forEach(function (row) {
+      row.addEventListener('click', function () { openThread(row.getAttribute('data-id')); });
+    });
+  }
+
+  // Search results render into the same #conv-list element as regular
+  // conversations -- one list, showing one or the other depending on
+  // whether the search box has anything typed into it, rather than a
+  // second, separate list competing for space on a narrow window.
+  function renderSearchResults(results) {
+    var listEl = el('conv-list');
+    if (!results.length) {
+      listEl.innerHTML = '<div class="empty-state">No one matches that search.</div>';
+      return;
+    }
+    listEl.innerHTML = results.map(function (p) {
+      return '<div class="conv-row" data-id="new:' + p.id + '">' +
+        '<div class="avatar">' + initials(p.name) + '</div>' +
+        '<div style="min-width:0; flex:1;">' +
+          '<p class="conv-name">' + p.name + '</p>' +
+          '<p class="conv-preview">' + (p.designation || p.email || '') + '</p>' +
+        '</div>' +
       '</div>';
     }).join('');
     listEl.querySelectorAll('.conv-row').forEach(function (row) {
@@ -340,11 +432,17 @@
   }
 
   function openThread(id) {
-    activeThreadId = id;
-    var person = conversations.find(function (c) { return c.id === id; }).person;
-    el('thread-name').textContent = person.name;
+    var row = conversations.find(function (c) { return c.id === id; });
+    el('thread-name').textContent = row ? row.name : '';
     el('thread-view').hidden = false;
-    window.nestrAPI.getThread(id).then(renderThread);
+    window.nestrAPI.getThread(id).then(function (result) {
+      // id might have been a 'new:<employee_id>' virtual row -- the
+      // real, resolved conversation_id comes back here, and every
+      // call after this point (sending, matching incoming realtime
+      // events) needs to use that real id, not the virtual one.
+      activeThreadId = result.conversationId;
+      renderThread(result.messages);
+    });
   }
 
   function renderThread(messages) {
@@ -368,7 +466,10 @@
     if (!body || !activeThreadId) return;
     input.value = '';
     window.nestrAPI.sendMessage(activeThreadId, body).then(function () {
-      window.nestrAPI.getThread(activeThreadId).then(renderThread);
+      window.nestrAPI.getThread(activeThreadId).then(function (result) {
+        activeThreadId = result.conversationId;
+        renderThread(result.messages);
+      });
     }).catch(function () { input.value = body; });
   }
   el('thread-send').addEventListener('click', sendCurrentMessage);
@@ -376,21 +477,43 @@
 
   window.nestrAPI.onNewMessage(function (m) {
     refreshUnreadBadge();
-    if (!el('messenger-screen').hidden) loadConversations();
-    if (activeThreadId && (m.sender_id === activeThreadId || m.recipient_id === activeThreadId)) {
-      window.nestrAPI.getThread(activeThreadId).then(renderThread);
+    // Only refreshes the visible list if it's actually showing
+    // conversations right now -- an incoming message shouldn't wipe
+    // out someone's in-progress search results out from under them.
+    if (!el('messenger-screen').hidden && !el('conv-search').value.trim()) loadConversations();
+    if (activeThreadId && m.conversation_id === activeThreadId) {
+      window.nestrAPI.getThread(activeThreadId).then(function (result) {
+        renderThread(result.messages);
+      });
     }
   });
 
-  window.nestrAPI.onOpenThread(function (otherId) {
+  window.nestrAPI.onOpenThread(function (conversationId) {
     showScreen('messenger');
     (conversations.length ? Promise.resolve() : window.nestrAPI.getConversations().then(function (rows) {
       conversations = rows;
       renderConvList();
-    })).then(function () { openThread(otherId); });
+    })).then(function () { openThread(conversationId); });
   });
 
   /* ---------------- boot ---------------- */
   initTheme();
-  showScreen('company');
+  // A restored session (see main.js's restoreSessionIfAny) means
+  // skipping the company-code/login screens entirely, not just
+  // defaulting to showing them regardless. Same monitoring-consent
+  // check as the login flow itself, for the same reason: policy
+  // could have changed since whatever earlier login actually
+  // established this persisted session.
+  window.nestrAPI.getSession().then(function (s) {
+    if (!s) { showScreen('company'); return; }
+    session = s;
+    return window.nestrAPI.getMonitoringStatus().then(function (status) {
+      if (status.enabled && !status.consented) {
+        el('consent-text').textContent = status.disclosureText || '';
+        showScreen('consent');
+      } else {
+        return routeAfterAuth();
+      }
+    });
+  }).catch(function () { showScreen('company'); });
 })();

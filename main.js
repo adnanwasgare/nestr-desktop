@@ -12,13 +12,52 @@ const { autoUpdater } = require('electron-updater');
 const SUPABASE_URL = 'https://kphonfpcqcwkrpacezpl.supabase.co';
 const SUPABASE_ANON_KEY = 'sb_publishable_OUDECUpO1JLpyhC2n_3BRQ_ktXYAsRN';
 
-// No storage option is configured here on purpose. In a Node context
-// (unlike a browser), that means the session lives in memory only for
-// as long as this process runs -- there is nothing to persist to
-// disk, and nothing to clear. Every fresh launch of the app starts
-// with no session at all, which is what satisfies "PIN required every
-// launch" -- no extra logic needed for that requirement, it falls out
-// of where this client lives.
+function settingsPath() {
+  return path.join(app.getPath('userData'), 'nestr-settings.json');
+}
+
+function sessionStoragePath() {
+  return path.join(app.getPath('userData'), 'nestr-session.json');
+}
+
+// A generic key-value store backed by its own file, separate from
+// theme settings (nestr-settings.json) so the two can be cleared
+// independently -- logging out should wipe the session file without
+// touching a saved theme preference, and vice versa.
+//
+// This REVERSES a deliberate earlier decision: no storage was
+// configured on purpose before, specifically so a PIN was required
+// on every single launch as a security measure. Requested explicitly
+// now, so built properly -- but worth stating plainly that this
+// trade-off was intentional before, not an oversight being corrected.
+const sessionStorage = {
+  _read() {
+    try { return JSON.parse(fs.readFileSync(sessionStoragePath(), 'utf8')); }
+    catch (e) { return {}; }
+  },
+  _write(obj) {
+    try { fs.writeFileSync(sessionStoragePath(), JSON.stringify(obj)); }
+    catch (e) { /* non-fatal -- session simply won't persist this run */ }
+  },
+  getItem(key) {
+    const all = this._read();
+    return Object.prototype.hasOwnProperty.call(all, key) ? all[key] : null;
+  },
+  setItem(key, value) {
+    const all = this._read();
+    all[key] = value;
+    this._write(all);
+  },
+  removeItem(key) {
+    const all = this._read();
+    delete all[key];
+    this._write(all);
+  }
+};
+
+// storage: sessionStorage -- the actual fix. Previously no storage
+// was configured at all (see the comment on sessionStorage above for
+// why, and why that's now deliberately being reversed).
 //
 // realtime.transport: unlike a browser, Node has no built-in
 // WebSocket global (pre-22), which is what the Realtime module needs
@@ -26,19 +65,14 @@ const SUPABASE_ANON_KEY = 'sb_publishable_OUDECUpO1JLpyhC2n_3BRQ_ktXYAsRN';
 // already a listed dependency for exactly this, but never actually
 // wired in here -- this is that fix.
 let supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+  auth: { storage: sessionStorage, persistSession: true, autoRefreshToken: true },
   realtime: { transport: WebSocket }
 });
 
 /* ----------------------------------------------------------
-   Theme -- a UI preference, not auth state, so this is
-   deliberately allowed to persist across launches even though
-   the login session itself never does. Kept in its own small
-   file, entirely separate from anything session-related.
+   Theme -- a UI preference, not auth state, kept in its own
+   small file, entirely separate from anything session-related.
    ---------------------------------------------------------- */
-
-function settingsPath() {
-  return path.join(app.getPath('userData'), 'nestr-settings.json');
-}
 
 function loadSavedTheme() {
   try {
@@ -118,7 +152,36 @@ async function edgeErrorMessage(err, fallback) {
   return (err && err.message) || fallback;
 }
 
-async function doLogin(companyCode, employeeId, pin) {
+// Shared by doLogin() and the startup session-restore logic below --
+// both need to turn a Supabase auth user's app_metadata into this
+// app's own session shape.
+//
+// Includes a real-name lookup because Supabase Auth's own
+// user_metadata for full_name is never actually set by the sign-in
+// flow -- found the same bug here as the web app's
+// employee-dashboard.js had, fixed the same way: queried directly
+// from employees, the same proven, working pattern the rest of this
+// app's own queries already use, rather than trusting a metadata
+// field that's silently always empty.
+async function buildSessionFromAuthUser(user, fallbackName) {
+  const meta = (user && user.app_metadata) || {};
+  if (!meta.company_id || !meta.employee_id) return null;
+
+  const built = {
+    companyId: meta.company_id,
+    employeeId: meta.employee_id,
+    role: meta.employee_role || 'employee',
+    fullName: fallbackName || meta.employee_id
+  };
+
+  const nameRes = await supabase.from('employees').select('full_name').eq('id', meta.employee_id).maybeSingle();
+  if (!nameRes.error && nameRes.data && nameRes.data.full_name) {
+    built.fullName = nameRes.data.full_name;
+  }
+  return built;
+}
+
+async function doLogin(companyCode, employeeId, pin, location) {
   const { error: anonErr } = await supabase.auth.signInAnonymously();
   if (anonErr) throw new Error(anonErr.message || 'Could not start a session.');
 
@@ -133,24 +196,38 @@ async function doLogin(companyCode, employeeId, pin) {
   const { data: refreshed, error: refErr } = await supabase.auth.refreshSession();
   if (refErr) throw new Error(refErr.message || 'Could not complete sign in.');
 
-  const meta = (refreshed && refreshed.session && refreshed.session.user &&
-                refreshed.session.user.app_metadata) || {};
-  if (!meta.company_id || !meta.employee_id) {
+  session = await buildSessionFromAuthUser(refreshed && refreshed.session && refreshed.session.user, employeeId);
+  if (!session) {
     throw new Error('Sign in did not return a valid session. Try again.');
   }
 
-  session = {
-    companyId: meta.company_id,
-    employeeId: meta.employee_id,
-    role: meta.employee_role || 'employee',
-    fullName: (refreshed.session.user.user_metadata &&
-               refreshed.session.user.user_metadata.full_name) || employeeId
-  };
+  // Location is mandatory at login here too, matching the web app.
+  // Recorded after the session above is fully established (the RPC
+  // needs a valid session to attach the record to) but before
+  // returning success to the renderer. If it fails, signed back out
+  // rather than left with a valid session and no location recorded
+  // -- otherwise someone could just retry other actions with an
+  // already-valid session, bypassing the requirement entirely.
+  if (!location || typeof location.lat !== 'number' || typeof location.lng !== 'number') {
+    try { await supabase.auth.signOut(); } catch (e) { /* ignore -- already failing */ }
+    session = null;
+    throw new Error('Location is required to sign in.');
+  }
+  const { error: locErr } = await supabase.rpc('record_login_location', {
+    p_latitude: location.lat, p_longitude: location.lng
+  });
+  if (locErr) {
+    try { await supabase.auth.signOut(); } catch (e) { /* ignore -- already failing */ }
+    session = null;
+    throw new Error(locErr.message || 'Could not record your location. Try again.');
+  }
+
   return session;
 }
 
 async function doLogout() {
   try { await supabase.auth.signOut(); } catch (e) { /* ignore -- clearing local state regardless */ }
+  unsubscribePunchRealtime();
   resetLocalState();
 }
 
@@ -214,8 +291,50 @@ async function refreshPunchState() {
   return punchState;
 }
 
-async function doPunch(type) {
-  const { error } = await supabase.rpc('punch', { p_type: type, p_source: 'agent' });
+let punchRealtimeChannel = null;
+
+// Keeps this app's punch state in sync with punches made anywhere
+// else -- the web app, or this same person's account open on a
+// different machine. Without this, a check-in on the web wouldn't
+// show up here until something else happened to trigger a refresh
+// (opening the app, clicking something), which could mean this app's
+// UI and tray disagree with reality for an entire day.
+function subscribePunchRealtime() {
+  if (punchRealtimeChannel || !session) return;
+  punchRealtimeChannel = supabase
+    .channel('nestr-desktop-punches')
+    .on('postgres_changes', {
+      event: 'INSERT', schema: 'public', table: 'attendance_punches',
+      filter: 'employee_id=eq.' + session.employeeId
+    }, async () => {
+      // A single payload row isn't enough to correctly recompute
+      // breakMs (that needs the whole day's punches paired up), so a
+      // full refresh rather than patching in just the new row.
+      try {
+        await refreshPunchState();
+        updateTrayMenu();
+        if (mainWindow) mainWindow.webContents.send('nestr:punch-updated', punchState);
+      } catch (e) {
+        console.error('[nestr] punch realtime refresh failed:', e);
+      }
+    })
+    .subscribe();
+}
+
+function unsubscribePunchRealtime() {
+  if (punchRealtimeChannel) {
+    supabase.removeChannel(punchRealtimeChannel);
+    punchRealtimeChannel = null;
+  }
+}
+
+async function doPunch(type, location) {
+  if (!location || typeof location.lat !== 'number' || typeof location.lng !== 'number') {
+    throw new Error('Location is required to record this.');
+  }
+  const { error } = await supabase.rpc('punch', {
+    p_type: type, p_source: 'agent', p_latitude: location.lat, p_longitude: location.lng
+  });
   if (error) throw new Error(error.message);
   await refreshPunchState();
   updateTrayMenu();
@@ -443,60 +562,155 @@ async function startMonitoringIfApplicable() {
    for what it needs.
    ---------------------------------------------------------- */
 
-function otherPartyOf(m) {
-  return m.sender_id === session.employeeId ? m.recipient_id : m.sender_id;
+/* ----------------------------------------------------------
+   Messaging -- rebuilt for the conversation-based backend
+   (migrations 048-052). Every message now belongs to a
+   conversation rather than directly to two people; a
+   conversation separately tracks who's in it via
+   conversation_participants. This mirrors messages.js's own
+   rebuild for the same schema change -- same reasoning, ported
+   to this app's IPC architecture rather than direct DOM access.
+
+   Scoped deliberately: reads and participates in both 1:1 and
+   group conversations correctly (someone on desktop can see and
+   reply to a group message sent from the web app), but doesn't
+   add a "create new group" UI here -- that's a larger, separate
+   addition, not needed just to fix the regression this session's
+   earlier group-chat work introduced for this app specifically.
+   ---------------------------------------------------------- */
+
+var conversationMeta = {}; // conversation_id -> {id, isGroup, name, participantIds}
+
+function displayNameForConv(conv) {
+  if (conv.isGroup) return conv.name || 'Group';
+  var otherId = conv.participantIds.filter((id) => id !== session.employeeId)[0];
+  return (people[otherId] && people[otherId].name) || 'Unknown';
 }
 
 async function loadMessagingData() {
-  const [peopleRes, msgRes] = await Promise.all([
-    supabase.from('employees').select('id, full_name, designation').eq('is_active', true).order('full_name'),
-    supabase.from('messages').select('id, sender_id, recipient_id, body, read_at, created_at').order('created_at')
-  ]);
+  const peopleRes = await supabase.rpc('list_messageable_colleagues');
   if (peopleRes.error) throw new Error(peopleRes.error.message);
 
   people = {};
-  (peopleRes.data || []).forEach((e) => { people[e.id] = { name: e.full_name, designation: e.designation }; });
+  (peopleRes.data || []).forEach((e) => { people[e.id] = { name: e.full_name, designation: e.designation, employeeNumber: e.employee_number, email: e.email }; });
+
+  const myConvRes = await supabase
+    .from('conversation_participants')
+    .select('conversation_id, conversations(id, is_group, name, created_at)')
+    .eq('employee_id', session.employeeId)
+    .is('left_at', null);
+  if (myConvRes.error) throw new Error(myConvRes.error.message);
+
+  conversationMeta = {};
+  const myConvIds = (myConvRes.data || []).map((r) => r.conversation_id);
+  (myConvRes.data || []).forEach((r) => {
+    const c = r.conversations;
+    if (!c) return;
+    conversationMeta[c.id] = { id: c.id, isGroup: c.is_group, name: c.name, participantIds: [] };
+  });
 
   threads = {};
-  ((msgRes.data) || []).forEach((m) => {
-    const other = otherPartyOf(m);
-    (threads[other] = threads[other] || []).push(m);
-  });
+  if (myConvIds.length) {
+    const [partRes, msgRes] = await Promise.all([
+      supabase.from('conversation_participants').select('conversation_id, employee_id').in('conversation_id', myConvIds).is('left_at', null),
+      supabase.from('messages').select('id, conversation_id, sender_id, recipient_id, body, read_at, created_at').in('conversation_id', myConvIds).order('created_at')
+    ]);
+    if (partRes.error) throw new Error(partRes.error.message);
+    if (msgRes.error) throw new Error(msgRes.error.message);
+
+    (partRes.data || []).forEach((p) => {
+      const conv = conversationMeta[p.conversation_id];
+      if (conv) conv.participantIds.push(p.employee_id);
+    });
+    (msgRes.data || []).forEach((m) => {
+      (threads[m.conversation_id] = threads[m.conversation_id] || []).push(m);
+    });
+  }
 
   subscribeRealtime();
   return buildConversationList();
 }
 
 function buildConversationList() {
-  return Object.keys(people)
-    .filter((id) => id !== session.employeeId)
+  // Requested explicitly: only real conversations (at least one
+  // message already exchanged) show up here -- not the full
+  // employee directory pre-listed as empty rows. Finding someone
+  // new to message now happens through search instead, which
+  // resolves the same lazy-conversation-creation path (see
+  // resolveConversationId below) once an actual message is sent.
+  var rows = Object.keys(conversationMeta)
+    .filter((id) => (threads[id] || []).length > 0)
     .map((id) => {
-      const msgs = threads[id] || [];
-      const last = msgs.length ? msgs[msgs.length - 1] : null;
-      const unread = msgs.filter((m) => m.recipient_id === session.employeeId && !m.read_at).length;
-      return { id, person: people[id], last, unread };
-    })
-    .sort((a, b) => {
-      if (a.last && b.last) return new Date(b.last.created_at) - new Date(a.last.created_at);
-      if (a.last) return -1;
-      if (b.last) return 1;
-      return (a.person.name || '').localeCompare(b.person.name || '');
+      var conv = conversationMeta[id];
+      var msgs = threads[id] || [];
+      var last = msgs.length ? msgs[msgs.length - 1] : null;
+      var unread = conv.isGroup ? 0 : msgs.filter((m) => m.recipient_id === session.employeeId && !m.read_at).length;
+      return { id: id, isGroup: conv.isGroup, name: displayNameForConv(conv), last: last, unread: unread };
     });
+
+  // Requested explicitly: unread conversations sort above read ones
+  // as their own group, not just wherever their timestamp happens to
+  // land -- then most-recent-first within each of those two groups.
+  return rows.sort((a, b) => {
+    var aUnread = a.unread > 0, bUnread = b.unread > 0;
+    if (aUnread !== bUnread) return aUnread ? -1 : 1;
+    if (a.last && b.last) return new Date(b.last.created_at) - new Date(a.last.created_at);
+    if (a.last) return -1;
+    if (b.last) return 1;
+    return (a.name || '').localeCompare(b.name || '');
+  });
 }
 
-async function doSendMessage(recipientId, body) {
+// Search over the full colleague directory (people, already fetched
+// by loadMessagingData) rather than only whoever already has a
+// conversation -- matches employee number, name, or email, the same
+// three fields the web app's own message search already matches.
+function searchPeople(query) {
+  var q = (query || '').trim().toLowerCase();
+  if (!q) return [];
+  return Object.keys(people)
+    .filter((id) => id !== session.employeeId)
+    .map((id) => Object.assign({ id: id }, people[id]))
+    .filter((p) => {
+      return (p.name || '').toLowerCase().indexOf(q) !== -1 ||
+             (p.employeeNumber || '').toLowerCase().indexOf(q) !== -1 ||
+             (p.email || '').toLowerCase().indexOf(q) !== -1;
+    })
+    .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+}
+
+async function resolveConversationId(id) {
+  if (id.indexOf('new:') !== 0) return id;
+  const otherId = id.slice(4);
+  const res = await supabase.rpc('create_or_get_conversation', { p_employee_ids: [otherId], p_is_group: false });
+  if (res.error) throw new Error(res.error.message);
+  const realId = res.data;
+  if (!conversationMeta[realId]) {
+    conversationMeta[realId] = { id: realId, isGroup: false, name: null, participantIds: [session.employeeId, otherId] };
+    threads[realId] = threads[realId] || [];
+  }
+  return realId;
+}
+
+async function doSendMessage(convOrNewId, body) {
+  const conversationId = await resolveConversationId(convOrNewId);
+  const conv = conversationMeta[conversationId];
+  const recipientId = conv && !conv.isGroup ? conv.participantIds.filter((x) => x !== session.employeeId)[0] : null;
+
   const { data, error } = await supabase.from('messages').insert({
-    company_id: session.companyId, sender_id: session.employeeId,
-    recipient_id: recipientId, body
+    company_id: session.companyId, conversation_id: conversationId,
+    sender_id: session.employeeId, recipient_id: recipientId, body
   }).select('*').single();
   if (error) throw new Error(error.message);
 
-  (threads[recipientId] = threads[recipientId] || []).push(data);
-  return data;
+  (threads[conversationId] = threads[conversationId] || []).push(data);
+  return { conversationId: conversationId, message: data };
 }
 
-async function markThreadRead(otherId) {
-  const unread = (threads[otherId] || []).filter((m) => m.recipient_id === session.employeeId && !m.read_at);
+async function markThreadRead(conversationId) {
+  const conv = conversationMeta[conversationId];
+  if (!conv || conv.isGroup) return; // read receipts are 1:1-only, matching the web app
+  const unread = (threads[conversationId] || []).filter((m) => m.recipient_id === session.employeeId && !m.read_at);
   if (!unread.length) return;
   const now = new Date().toISOString();
   unread.forEach((m) => { m.read_at = now; });
@@ -508,15 +722,19 @@ function subscribeRealtime() {
   realtimeChannel = supabase
     .channel('nestr-desktop-messages')
     .on('postgres_changes', {
+      // Broad by company rather than filtered to "sent to me" --
+      // same reasoning as messages.js's own rebuild: a group
+      // message has no single recipient to filter by. RLS is what
+      // actually gates which rows this app receives.
       event: 'INSERT', schema: 'public', table: 'messages',
-      filter: 'recipient_id=eq.' + session.employeeId
+      filter: 'company_id=eq.' + session.companyId
     }, (payload) => {
       const m = payload.new;
-      const other = otherPartyOf(m);
-      (threads[other] = threads[other] || []).push(m);
+      if (!conversationMeta[m.conversation_id]) return; // a conversation not yet known locally
+      (threads[m.conversation_id] = threads[m.conversation_id] || []).push(m);
       if (mainWindow) mainWindow.webContents.send('nestr:new-message', m);
       updateTrayMenu();
-      notifyNewMessage(other, m);
+      notifyNewMessage(m.conversation_id, m);
     })
     .subscribe();
 }
@@ -525,12 +743,22 @@ function subscribeRealtime() {
 // window is already focused, since the person is actively looking at
 // the app at that point and a popup on top would just be redundant
 // with what they can already see updating live.
-function notifyNewMessage(senderId, m) {
+function notifyNewMessage(conversationId, m) {
   if (!Notification.isSupported()) return;
   if (mainWindow && mainWindow.isFocused()) return;
 
-  const sender = people[senderId];
-  const title = sender ? sender.name : 'New message';
+  const conv = conversationMeta[conversationId];
+  var title;
+  if (conv && conv.isGroup) {
+    // Group message -- title the notification with who actually
+    // sent it, not the group name, since the group is already
+    // implied by opening the thread.
+    const sender = people[m.sender_id];
+    title = (sender ? sender.name : 'Someone') + ' in ' + (conv.name || 'a group');
+  } else {
+    const sender = people[m.sender_id];
+    title = sender ? sender.name : 'New message';
+  }
   const body = m.body.length > 120 ? m.body.slice(0, 120) + '\u2026' : m.body;
 
   const notification = new Notification({
@@ -543,7 +771,7 @@ function notifyNewMessage(senderId, m) {
     if (!mainWindow) return;
     mainWindow.show();
     mainWindow.focus();
-    mainWindow.webContents.send('nestr:open-thread', senderId);
+    mainWindow.webContents.send('nestr:open-thread', conversationId);
   });
 
   notification.show();
@@ -645,7 +873,31 @@ function createTray() {
   updateTrayMenu();
 }
 
-app.whenReady().then(() => {
+// Runs once at startup, before the renderer's first nestr:get-session
+// call, so a restored session is already in place by the time it
+// asks -- otherwise the renderer would see session === null on that
+// first call regardless of what's actually saved on disk, and route
+// to the login screen even though a valid session exists.
+async function restoreSessionIfAny() {
+  try {
+    const { data, error } = await supabase.auth.getSession();
+    if (error || !data || !data.session) return;
+    const restored = await buildSessionFromAuthUser(data.session.user, null);
+    if (restored) {
+      session = restored;
+      await refreshPunchState();
+      await startMonitoringIfApplicable();
+      subscribePunchRealtime();
+    }
+  } catch (e) {
+    // Corrupt or unreadable session file, expired refresh token, etc.
+    // -- non-fatal, just falls through to the normal login screen.
+    console.error('[nestr] session restore failed:', e);
+  }
+}
+
+app.whenReady().then(async () => {
+  await restoreSessionIfAny();
   createWindow();
   createTray();
   checkForUpdates();
@@ -665,10 +917,11 @@ app.on('window-all-closed', () => {
    Supabase calls happen here in main, never in the renderer.
    ---------------------------------------------------------- */
 
-ipcMain.handle('nestr:login', async (_evt, { companyCode, employeeId, pin }) => {
-  const s = await doLogin(companyCode, employeeId, pin);
+ipcMain.handle('nestr:login', async (_evt, { companyCode, employeeId, pin, location }) => {
+  const s = await doLogin(companyCode, employeeId, pin, location);
   await refreshPunchState();
   await startMonitoringIfApplicable();
+  subscribePunchRealtime();
   updateTrayMenu();
   return s;
 });
@@ -704,13 +957,13 @@ ipcMain.handle('nestr:get-punch-state', async () => {
   return punchState;
 });
 
-ipcMain.handle('nestr:break-start', async () => {
-  const s = await doPunch('break_start');
+ipcMain.handle('nestr:break-start', async (event, location) => {
+  const s = await doPunch('break_start', location);
   return s;
 });
 
-ipcMain.handle('nestr:break-end', async () => {
-  const s = await doPunch('break_end');
+ipcMain.handle('nestr:break-end', async (event, location) => {
+  const s = await doPunch('break_end', location);
   return s;
 });
 
@@ -719,13 +972,13 @@ ipcMain.handle('nestr:get-shift-info', async () => {
   return shift || null;
 });
 
-ipcMain.handle('nestr:check-in', async () => {
-  const s = await doPunch('in');
+ipcMain.handle('nestr:check-in', async (event, location) => {
+  const s = await doPunch('in', location);
   return s;
 });
 
-ipcMain.handle('nestr:check-out', async () => {
-  const s = await doPunch('out');
+ipcMain.handle('nestr:check-out', async (event, location) => {
+  const s = await doPunch('out', location);
   return s;
 });
 
@@ -741,11 +994,21 @@ ipcMain.handle('nestr:get-conversations', async () => {
   return await loadMessagingData();
 });
 
-ipcMain.handle('nestr:get-thread', async (_evt, otherId) => {
-  await markThreadRead(otherId);
-  return threads[otherId] || [];
+ipcMain.handle('nestr:search-people', async (_evt, query) => {
+  return searchPeople(query);
 });
 
-ipcMain.handle('nestr:send-message', async (_evt, { recipientId, body }) => {
-  return await doSendMessage(recipientId, body);
+ipcMain.handle('nestr:get-thread', async (_evt, id) => {
+  // id may be a real conversation_id, or a 'new:<employee_id>'
+  // virtual row for someone with no conversation yet -- resolved
+  // (creating the real conversation lazily if needed) before
+  // marking read or returning anything, so the renderer gets back
+  // the real id to use for any message it sends in this thread.
+  const conversationId = await resolveConversationId(id);
+  await markThreadRead(conversationId);
+  return { conversationId: conversationId, messages: threads[conversationId] || [] };
+});
+
+ipcMain.handle('nestr:send-message', async (_evt, { conversationId, body }) => {
+  return await doSendMessage(conversationId, body);
 });

@@ -1,7 +1,7 @@
 {
   "name": "nestr-desktop",
-  "version": "2.3.5",
-  "description": "Nestr desktop companion — sign in, Break In/Out, and messaging.",
+  "version": "2.3.8",
+  "description": "Nestr desktop companion \u2014 sign in, Break In/Out, and messaging.",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
