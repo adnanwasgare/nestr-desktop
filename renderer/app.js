@@ -38,7 +38,20 @@
         function (err) {
           var msg;
           if (err.code === err.PERMISSION_DENIED) {
-            msg = 'Location access is blocked for Nestr. Enable it in your system\u2019s privacy/location settings, then try again.';
+            // Named specifically rather than generically -- this app
+            // only ever runs on Windows (no Mac/Linux build exists),
+            // so there's no reason to hedge with vague, cross-platform
+            // wording the way the web app's equivalent message
+            // correctly does, since that one genuinely runs
+            // everywhere. The second sentence covers the specific,
+            // real case this session actually ran into on a client
+            // laptop: Settings shows location as already on, but a
+            // corporate/MDM policy silently overrides that at a level
+            // no in-app message could detect directly -- naming this
+            // possibility at least points someone toward asking IT,
+            // rather than leaving them stuck re-checking a setting
+            // that already looks correct.
+            msg = 'Location access is blocked for Nestr. Enable it in Windows Settings \u2192 Privacy & security \u2192 Location, then try again. If it\u2019s already turned on there and this keeps happening, your organization\u2019s IT policy may be blocking it \u2014 worth checking with them.';
           } else if (err.code === err.TIMEOUT) {
             msg = 'Getting your location took too long. Check your device\u2019s location/GPS is on, then try again.';
           } else {
