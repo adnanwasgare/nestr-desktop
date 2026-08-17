@@ -332,6 +332,26 @@ async function doPunch(type, location) {
   if (!location || typeof location.lat !== 'number' || typeof location.lng !== 'number') {
     throw new Error('Location is required to record this.');
   }
+  // Face verification is enforced by refusing the punch here, not by
+  // performing it.
+  //
+  // The web app captures a photo and matches it against the person's
+  // enrolment. This app cannot -- it has no face model and no camera
+  // capture in the punch flow -- so if it punched anyway, anyone
+  // subject to face checks could skip them entirely by using the
+  // desktop app. That would not be a gap in the feature so much as a
+  // documented way around it.
+  //
+  // Refusing and pointing at the web app is the honest behaviour until
+  // this app can do the check itself.
+  const faceRequired = await faceVerificationRequired();
+  if (faceRequired) {
+    throw new Error(
+      'Your company requires face verification at check-in. ' +
+      'Please check in from the Nestr website or mobile app.'
+    );
+  }
+
   const { error } = await supabase.rpc('punch', {
     p_type: type, p_source: 'agent', p_latitude: location.lat, p_longitude: location.lng
   });
@@ -350,6 +370,47 @@ async function doPunch(type, location) {
    hardcoded. If is_enabled is false, none of this does anything
    at all.
    ---------------------------------------------------------- */
+
+/**
+ * Whether this employee must verify their face to check in.
+ *
+ * Read at punch time rather than cached: a company can enable face
+ * verification at any moment, and a stale answer here means either
+ * blocking someone who no longer needs it, or letting through someone
+ * who now does.
+ *
+ * Fails OPEN -- if the policy can't be read, the punch proceeds. An
+ * employee unable to record attendance because a settings lookup timed
+ * out is a worse outcome than an unverified punch, and matches how the
+ * web app treats the same failure.
+ */
+async function faceVerificationRequired() {
+  try {
+    const { data: pol, error: polErr } = await supabase
+      .from('monitoring_policies')
+      .select('face_attendance_enabled, face_attendance_scope')
+      .eq('company_id', session.companyId)
+      .order('version', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (polErr || !pol || !pol.face_attendance_enabled) return false;
+
+    const { data: emp } = await supabase
+      .from('employees')
+      .select('work_mode')
+      .eq('id', session.employeeId)
+      .maybeSingle();
+
+    const mode = ((emp && emp.work_mode) || 'office').toLowerCase();
+    // 'field' scope means only field staff are checked; office workers
+    // punching from a desk are unaffected.
+    return pol.face_attendance_scope === 'all' || mode === 'field';
+  } catch (e) {
+    console.error('[nestr] face policy check failed, allowing punch:', e && e.message);
+    return false;
+  }
+}
 
 async function fetchMonitoringPolicy() {
   const { data, error } = await supabase
@@ -463,10 +524,126 @@ async function bumpActivityDay(deltas) {
   }
 }
 
+/**
+ * Encodes a captured screen to WebP, falling back to JPEG.
+ *
+ * Electron's nativeImage can produce PNG and JPEG but has no WebP
+ * encoder, so this borrows the renderer's -- the renderer is Chromium,
+ * which encodes WebP natively. The image is handed over as a data URL,
+ * drawn to a canvas there, and comes back encoded.
+ *
+ * Two things this deliberately guards against:
+ *
+ *  - A browser that can't encode WebP does NOT error on
+ *    toDataURL('image/webp'); it silently returns a PNG instead. The
+ *    prefix is checked rather than trusted, otherwise a PNG would be
+ *    uploaded under a .webp name and the saving would quietly not
+ *    happen.
+ *  - The window may be closed to tray, or not yet created, while
+ *    capture continues. Any failure falls through to JPEG, which needs
+ *    no renderer and is still far smaller than PNG.
+ */
+/**
+ * One-time notice when monitoring is switched back on.
+ *
+ * Persisted rather than held in memory so restarting the app doesn't
+ * re-announce it every launch, and so someone who was offline when it
+ * was re-enabled still finds out on their next start.
+ */
+function notifyMonitoringResumed() {
+  try {
+    const seenVersion = sessionStorage.getItem('monitoringResumedNotice');
+    const stamp = String(monitoringPolicy.version) + ':on';
+    if (seenVersion === stamp) return;
+    sessionStorage.setItem('monitoringResumedNotice', stamp);
+
+    new Notification({
+      title: 'Activity monitoring resumed',
+      body: 'Your administrator has re-enabled activity monitoring for this company.'
+    }).show();
+  } catch (e) {
+    console.error('[nestr] could not show monitoring notice:', e && e.message);
+  }
+}
+
+async function encodeScreenshot(image) {
+  const webp = await encodeViaRenderer(image, 0.72);
+  if (webp) return { buffer: webp, ext: 'webp', contentType: 'image/webp' };
+  return { buffer: image.toJPEG(70), ext: 'jpg', contentType: 'image/jpeg' };
+}
+
+async function encodeViaRenderer(image, quality) {
+  if (!mainWindow || mainWindow.isDestroyed() || !mainWindow.webContents) return null;
+  try {
+    const src = image.toDataURL();
+    const out = await mainWindow.webContents.executeJavaScript(
+      '(function (src, q) { return new Promise(function (resolve) {' +
+      '  var img = new Image();' +
+      '  img.onload = function () {' +
+      '    try {' +
+      '      var c = document.createElement("canvas");' +
+      '      c.width = img.naturalWidth; c.height = img.naturalHeight;' +
+      '      c.getContext("2d").drawImage(img, 0, 0);' +
+      '      var d = c.toDataURL("image/webp", q);' +
+      '      resolve(d.indexOf("data:image/webp") === 0 ? d : null);' +
+      '    } catch (e) { resolve(null); }' +
+      '  };' +
+      '  img.onerror = function () { resolve(null); };' +
+      '  img.src = src;' +
+      '}); })(' + JSON.stringify(src) + ', ' + quality + ')',
+      true
+    );
+    if (!out) return null;
+    return Buffer.from(out.split(',')[1], 'base64');
+  } catch (e) {
+    console.error('[nestr] webp encode failed, falling back to jpeg:', e && e.message);
+    return null;
+  }
+}
+
 async function captureAndUploadScreenshot() {
-  if (!monitoringPolicy || !monitoringPolicy.is_enabled) return;
+  // The policy is re-read here, immediately before capturing, rather
+  // than relying on the copy fetched at startup.
+  //
+  // Previously it was only loaded once when monitoring initialised,
+  // so an admin switching monitoring off company-wide had no effect on
+  // any machine already running -- it kept capturing against a stale
+  // policy until the app was restarted, potentially for days. For a
+  // control whose entire purpose is "stop this now", that made the
+  // switch misleading.
+  //
+  // Checking here rather than on a separate timer is deliberate: it
+  // makes "am I allowed to capture" and "capture" the same operation,
+  // so there is no window in which a stale policy permits a screenshot
+  // that shouldn't be taken. One extra query per user per interval is
+  // a small price for that guarantee.
+  const previouslyEnabled = monitoringPolicy && monitoringPolicy.is_enabled;
+  await fetchMonitoringPolicy();
+
+  if (!monitoringPolicy || !monitoringPolicy.is_enabled) {
+    if (previouslyEnabled) {
+      console.log('[nestr] monitoring switched off company-wide -- capture paused');
+    }
+    // Deliberately does NOT cancel the timer: the loop has to stay
+    // alive to notice if monitoring is switched back on.
+    return;
+  }
+
+  // Off -> on while this app was running: tell the person rather than
+  // silently resuming. Consent is recorded against a policy version
+  // and toggling doesn't bump it, so nobody is re-prompted -- which
+  // makes an explicit notice the only thing standing between this and
+  // monitoring quietly restarting unannounced.
+  if (!previouslyEnabled) notifyMonitoringResumed();
+
   if (monitoringPolicy.capture_only_when_checked_in && !isActivelyCheckedIn()) return;
-  if (!monitoringConsented) return;
+
+  // Consent is re-checked because the policy may have changed version
+  // since startup, and consent is per-version.
+  if (!monitoringConsented) {
+    await checkConsent();
+    if (!monitoringConsented) return;
+  }
 
   const sources = await desktopCapturer.getSources({
     types: ['screen'],
@@ -488,11 +665,16 @@ async function captureAndUploadScreenshot() {
   const idleSeconds = powerMonitor.getSystemIdleTime();
   const activityLevel = idleSeconds > 300 ? 'low' : (idleSeconds > 60 ? 'moderate' : 'high');
 
-  const buffer = image.toPNG();
-  const storagePath = session.companyId + '/' + session.employeeId + '/' + Date.now() + '.png';
+  // WebP where possible, JPEG otherwise. PNG was costing roughly
+  // 500KB-1.5MB per capture; WebP at this quality typically lands
+  // around 40-80KB for the same screen, which is the difference
+  // between tens of GB a month and a few.
+  const encoded = await encodeScreenshot(image);
+  const storagePath = session.companyId + '/' + session.employeeId + '/' +
+    Date.now() + '.' + encoded.ext;
 
-  const { error: upErr } = await supabase.storage.from('screenshots').upload(storagePath, buffer, {
-    contentType: 'image/png'
+  const { error: upErr } = await supabase.storage.from('screenshots').upload(storagePath, encoded.buffer, {
+    contentType: encoded.contentType
   });
   if (upErr) { console.error('[nestr] screenshot upload failed:', upErr.message); return; }
 
@@ -529,7 +711,20 @@ function activityTick() {
 // to work around.
 function scheduleNextCapture() {
   if (captureTimer) clearTimeout(captureTimer);
-  if (!monitoringPolicy || !monitoringPolicy.is_enabled || !monitoringConsented) return;
+
+  // The loop keeps ticking while a policy EXISTS, even when monitoring
+  // is currently switched off or unconsented -- it just doesn't
+  // capture. Stopping the loop on disable meant nothing was left
+  // running to notice a later re-enable, so monitoring stayed off
+  // until the app was restarted, which is not what "switch it back
+  // on" should mean.
+  //
+  // The tick itself is one small policy read per interval, and
+  // captureAndUploadScreenshot() decides each time whether to
+  // actually capture. Where no policy exists at all, this stops
+  // properly rather than polling forever for a company that doesn't
+  // use monitoring.
+  if (!monitoringPolicy) return;
 
   const base = monitoringPolicy.screenshot_interval_seconds * 1000;
   const jitter = base * (0.8 + Math.random() * 0.4);
@@ -542,7 +737,10 @@ function scheduleNextCapture() {
 
 async function startMonitoringIfApplicable() {
   await fetchMonitoringPolicy();
-  if (!monitoringPolicy || !monitoringPolicy.is_enabled) return;
+  // Started whenever a policy exists at all. If it's currently
+  // switched off the loop simply doesn't capture -- but it's running,
+  // so a later re-enable is picked up without needing a restart.
+  if (!monitoringPolicy) return;
 
   await checkConsent();
   await registerDevice();
@@ -783,6 +981,23 @@ function notifyNewMessage(conversationId, m) {
    what's actually valid next.
    ---------------------------------------------------------- */
 
+/**
+ * Brings the window up so a punch can be made properly.
+ *
+ * Every punch needs a location, and only the renderer can obtain one.
+ * The ellipsis on the tray labels signals that these open something
+ * rather than acting immediately.
+ */
+function showWindowForPunch() {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    createWindow();
+    return;
+  }
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
+}
+
 function updateTrayMenu() {
   if (!tray) return;
 
@@ -792,19 +1007,25 @@ function updateTrayMenu() {
 
   if (!session) {
     items.push({ label: 'Not signed in', enabled: false });
+  // These open the window rather than punching directly.
+  //
+  // They used to call doPunch() straight from the tray with NO
+  // location argument -- which doPunch rejects, because every punch
+  // must record where it happened. The error was then swallowed by the
+  // catch below, so clicking these did nothing at all, silently, and
+  // always had.
+  //
+  // The main process cannot obtain a location: geolocation lives in
+  // the renderer, which is why every working punch path goes through
+  // the window. So the honest fix is to open the window rather than
+  // pretend the tray can do it.
   } else if (punchState.last === 'break_start') {
     items.push({
-      label: 'End Break', click: async () => {
-        try { await doPunch('break_end'); mainWindow && mainWindow.webContents.send('nestr:punch-updated', punchState); }
-        catch (e) { /* surfaced in the main window when opened */ }
-      }
+      label: 'End Break\u2026', click: () => { showWindowForPunch(); }
     });
   } else if (punchState.last === 'in' || punchState.last === 'break_end') {
     items.push({
-      label: 'Start Break', click: async () => {
-        try { await doPunch('break_start'); mainWindow && mainWindow.webContents.send('nestr:punch-updated', punchState); }
-        catch (e) { /* surfaced in the main window when opened */ }
-      }
+      label: 'Start Break\u2026', click: () => { showWindowForPunch(); }
     });
   } else {
     items.push({ label: 'Clock in from the web app first', enabled: false });
