@@ -1,6 +1,6 @@
 {
   "name": "nestr-desktop",
-  "version": "2.5.2",
+  "version": "2.6.0",
   "description": "Nestr desktop companion \u2014 sign in, Break In/Out, and messaging.",
   "main": "main.js",
   "scripts": {

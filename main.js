@@ -201,34 +201,15 @@ async function doLogin(companyCode, employeeId, pin, location) {
     throw new Error('Sign in did not return a valid session. Try again.');
   }
 
-  // Login location is recorded when the device can supply one, and
-  // sign-in proceeds when it can't.
+  // No location at sign-in.
   //
-  // This used to sign the person back out if no location was
-  // available, so that a session couldn't exist without one. The
-  // reasoning was sound, but the effect was that a wired desktop --
-  // which Windows cannot locate, having no GPS and no Wi-Fi to scan --
-  // could not sign in to the app at all. Not "could not check in":
-  // could not get past the login screen.
+  // It used to be captured here, and at one point could block the
+  // login entirely. Two problems with that: it prompted for location
+  // on a screen where nobody expects to be asked, and it recorded a
+  // position that answers no question anyone has -- attendance cares
+  // where someone CHECKED IN, not where they opened the app.
   //
-  // A login record without coordinates is a small loss. Someone unable
-  // to open the app they work in is not.
-  const hasLocation = location
-    && typeof location.lat === 'number'
-    && typeof location.lng === 'number';
-
-  if (hasLocation) {
-    const { error: locErr } = await supabase.rpc('record_login_location', {
-      p_latitude: location.lat, p_longitude: location.lng
-    });
-    // A failure here no longer undoes the sign-in. The audit record is
-    // worth having, not worth locking someone out over.
-    if (locErr) {
-      console.warn('[nestr] could not record login location:', locErr.message);
-    }
-  } else {
-    console.warn('[nestr] signing in without location \u2014 device could not provide one');
-  }
+  // Location now belongs to the punch flow alone.
 
   return session;
 }

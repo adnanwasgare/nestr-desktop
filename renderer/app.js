@@ -166,10 +166,12 @@
     var employeeId = el('employee-id').value.trim();
     var pin = el('pin').value;
 
-    // Location is mandatory at login here too, matching the web app
-    // -- same reasoning as the four punch handlers above.
-    getLocation()
-      .then(function (loc) { return window.nestrAPI.login(companyCode, employeeId, pin, loc); })
+    // No location at login -- it belongs to the punch flow, which is
+    // the only place the answer is used. Asking on the sign-in screen
+    // prompts people where they don't expect it, for a position
+    // nothing consults.
+    Promise.resolve()
+      .then(function () { return window.nestrAPI.login(companyCode, employeeId, pin, null); })
       .then(function (s) {
         session = s;
         el('pin').value = '';
@@ -322,7 +324,11 @@
       el('punch-timer').textContent = 'On break';
       stopTimer();
       breakBtn.textContent = 'End break';
-      breakBtn.onclick = function () { doPunchAction(getLocation().then(function (loc) { return window.nestrAPI.breakEnd(loc); })); };
+      // Breaks record their time but not a position: someone stepping
+      // away from their desk hasn't gone anywhere worth recording, and
+      // prompting for location four times a day is a lot of asking for
+      // an answer nobody reads.
+      breakBtn.onclick = function () { doPunchAction(window.nestrAPI.breakEnd(null)); };
       checkoutBtn.disabled = false;
       return;
     }
@@ -331,7 +337,7 @@
     el('punch-since').textContent = state.firstIn ? ('Since ' + timeLabel(state.firstIn)) : '';
     startTimer(state.firstIn, state.breakMs);
     breakBtn.textContent = 'Start break';
-    breakBtn.onclick = function () { doPunchAction(getLocation().then(function (loc) { return window.nestrAPI.breakStart(loc); })); };
+    breakBtn.onclick = function () { doPunchAction(window.nestrAPI.breakStart(null)); };
     checkoutBtn.disabled = false;
   }
 
