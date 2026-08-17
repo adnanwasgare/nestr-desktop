@@ -201,25 +201,33 @@ async function doLogin(companyCode, employeeId, pin, location) {
     throw new Error('Sign in did not return a valid session. Try again.');
   }
 
-  // Location is mandatory at login here too, matching the web app.
-  // Recorded after the session above is fully established (the RPC
-  // needs a valid session to attach the record to) but before
-  // returning success to the renderer. If it fails, signed back out
-  // rather than left with a valid session and no location recorded
-  // -- otherwise someone could just retry other actions with an
-  // already-valid session, bypassing the requirement entirely.
-  if (!location || typeof location.lat !== 'number' || typeof location.lng !== 'number') {
-    try { await supabase.auth.signOut(); } catch (e) { /* ignore -- already failing */ }
-    session = null;
-    throw new Error('Location is required to sign in.');
-  }
-  const { error: locErr } = await supabase.rpc('record_login_location', {
-    p_latitude: location.lat, p_longitude: location.lng
-  });
-  if (locErr) {
-    try { await supabase.auth.signOut(); } catch (e) { /* ignore -- already failing */ }
-    session = null;
-    throw new Error(locErr.message || 'Could not record your location. Try again.');
+  // Login location is recorded when the device can supply one, and
+  // sign-in proceeds when it can't.
+  //
+  // This used to sign the person back out if no location was
+  // available, so that a session couldn't exist without one. The
+  // reasoning was sound, but the effect was that a wired desktop --
+  // which Windows cannot locate, having no GPS and no Wi-Fi to scan --
+  // could not sign in to the app at all. Not "could not check in":
+  // could not get past the login screen.
+  //
+  // A login record without coordinates is a small loss. Someone unable
+  // to open the app they work in is not.
+  const hasLocation = location
+    && typeof location.lat === 'number'
+    && typeof location.lng === 'number';
+
+  if (hasLocation) {
+    const { error: locErr } = await supabase.rpc('record_login_location', {
+      p_latitude: location.lat, p_longitude: location.lng
+    });
+    // A failure here no longer undoes the sign-in. The audit record is
+    // worth having, not worth locking someone out over.
+    if (locErr) {
+      console.warn('[nestr] could not record login location:', locErr.message);
+    }
+  } else {
+    console.warn('[nestr] signing in without location \u2014 device could not provide one');
   }
 
   return session;
@@ -329,8 +337,26 @@ function unsubscribePunchRealtime() {
 }
 
 async function doPunch(type, location) {
-  if (!location || typeof location.lat !== 'number' || typeof location.lng !== 'number') {
-    throw new Error('Location is required to record this.');
+  // Location is recorded when available, and the punch proceeds when
+  // it isn't.
+  //
+  // Refusing was the original rule, and it made sense for field staff
+  // -- knowing where they clocked in is the point. But it also meant
+  // an office worker at a WIRED desktop could not check in at all:
+  // Windows locates a machine without GPS by scanning Wi-Fi, and a
+  // wired PC with Wi-Fi off has nothing to scan. No setting they could
+  // change would fix it.
+  //
+  // Blocking someone from recording their attendance because their
+  // desk has an ethernet cable is a worse outcome than a punch with no
+  // coordinates. The punch is the record that matters; the location is
+  // evidence about it.
+  const hasLocation = location
+    && typeof location.lat === 'number'
+    && typeof location.lng === 'number';
+
+  if (!hasLocation) {
+    console.warn('[nestr] punching without location \u2014 device could not provide one');
   }
   // Face verification is enforced by refusing the punch here, not by
   // performing it.
@@ -353,7 +379,10 @@ async function doPunch(type, location) {
   }
 
   const { error } = await supabase.rpc('punch', {
-    p_type: type, p_source: 'agent', p_latitude: location.lat, p_longitude: location.lng
+    p_type: type,
+    p_source: 'agent',
+    p_latitude: hasLocation ? location.lat : null,
+    p_longitude: hasLocation ? location.lng : null
   });
   if (error) throw new Error(error.message);
   await refreshPunchState();

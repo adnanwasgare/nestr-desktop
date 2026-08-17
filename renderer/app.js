@@ -30,9 +30,32 @@
   function getLocation() {
     return new Promise(function (resolve, reject) {
       if (!navigator.geolocation) {
-        reject(new Error('This device doesn\u2019t support location. Location is required to check in.'));
+        console.warn('[nestr] this device has no geolocation support');
+        resolve(null);
         return;
       }
+      // These options replace { enableHighAccuracy: true, timeout:
+      // 15000, maximumAge: 0 }, which is close to the worst possible
+      // combination for a desktop PC.
+      //
+      // maximumAge is the important one. It defaults to 0, meaning
+      // "resolve a fresh position every time, never reuse one". A
+      // laptop with GPS manages that; a desktop has no GPS at all, so
+      // Windows locates it by scanning nearby Wi-Fi networks. On a
+      // machine that is wired, or has Wi-Fi switched off, there is
+      // nothing to scan and Windows reports POSITION_UNAVAILABLE --
+      // which is exactly the "couldn't determine your location"
+      // message people were seeing while Windows logged the request as
+      // successfully received.
+      //
+      // Allowing a position from the last five minutes means a machine
+      // that resolved once keeps working, instead of failing on every
+      // punch.
+      //
+      // enableHighAccuracy stays false deliberately: it asks for GPS,
+      // which a desktop does not have, and makes the request slower
+      // and MORE likely to fail on exactly the hardware struggling
+      // here. Attendance needs to know the building, not the desk.
       navigator.geolocation.getCurrentPosition(
         function (pos) { resolve({ lat: pos.coords.latitude, lng: pos.coords.longitude }); },
         function (err) {
@@ -55,11 +78,32 @@
           } else if (err.code === err.TIMEOUT) {
             msg = 'Getting your location took too long. Check your device\u2019s location/GPS is on, then try again.';
           } else {
-            msg = 'Couldn\u2019t determine your location. Check your device\u2019s location/GPS is on, then try again.';
+            // POSITION_UNAVAILABLE. On a desktop this is usually not a
+            // settings problem at all -- Windows locates a machine
+            // without GPS by scanning Wi-Fi, so a wired PC with Wi-Fi
+            // off has nothing to work from. Saying "check location is
+            // on" sends people to a setting that is already correct,
+            // which is where this message previously left them.
+            msg = 'Windows couldn\u2019t work out where this computer is. ' +
+                  'Desktop PCs have no GPS, so Windows uses nearby Wi-Fi networks \u2014 ' +
+                  'if this machine is on a wired connection with Wi-Fi switched off, turn Wi-Fi on ' +
+                  '(it doesn\u2019t need to be connected) and try again. ' +
+                  'Otherwise you can check in from the Nestr website on your phone.';
           }
-          reject(new Error(msg));
+          // Resolved rather than rejected.
+          //
+          // The main process now records a punch or sign-in without
+          // coordinates when the device cannot supply them, so
+          // rejecting here would block the very case that change was
+          // made to allow -- a wired desktop, which Windows cannot
+          // locate at all.
+          //
+          // The message is still logged, so the reason is visible when
+          // someone asks why their location is missing.
+          console.warn('[nestr] location unavailable:', msg);
+          resolve(null);
         },
-        { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
+        { enableHighAccuracy: false, timeout: 20000, maximumAge: 300000 }
       );
     });
   }
